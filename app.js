@@ -680,3 +680,4 @@ qs('#btnNewInvoice').addEventListener('click', () => {
   qs('#invoiceItemsBody').innerHTML = '';
   addInvoiceRow();
   updateInv
+   
