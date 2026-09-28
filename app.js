@@ -679,5 +679,401 @@ qs('#btnNewInvoice').addEventListener('click', () => {
   qs('#invPaidNow').value = 0;
   qs('#invoiceItemsBody').innerHTML = '';
   addInvoiceRow();
-  updateInv
+    updateInvoiceGrandTotal();
+  openModal('modalInvoice');
+});
+
+/* ================= استكمال حفظ وتعديل وطباعة الفواتير ================= */
+window.editInvoice = function (id) {
+  const inv = STATE.invoices.find(i => i.id === id);
+  if (!inv) return;
+  editingInvoiceId = id;
+  qs('#invoiceModalTitle').textContent = 'تعديل الفاتورة #' + inv.invoice_number;
+  qs('#btnSaveInvoice').textContent = 'حفظ التعديلات';
+  qs('#invEditHint').style.display = 'block';
+  qs('#invPaidNowField').style.display = 'none';
+  qs('#invCustomerName').value = inv.customer_name || '';
+  qs('#invNumber').value = inv.invoice_number || '';
+  qs('#invDate').value = inv.invoice_date || todayISO();
+  qs('#invoiceItemsBody').innerHTML = '';
+  STATE.invoiceItems.filter(it => it.invoice_id === id).forEach(it => {
+    addInvoiceRow();
+    const tr = qs('#invoiceItemsBody tr:last-child');
+    tr.querySelector('.inv-item-product').value = it.product_id || '';
+    tr.querySelector('.inv-item-category').value = it.category || 'عادي';
+    tr.querySelector('.inv-item-qty').value = it.quantity || 1;
+    tr.querySelector('.inv-item-price').value = it.price || 0;
+    updateInvoiceRowTotal(tr);
+  });
+  openModal('modalInvoice');
+};
+
+qs('#btnSaveInvoice').addEventListener('click', async () => {
+  const customerName = qs('#invCustomerName').value.trim();
+  const invDate = qs('#invDate').value || todayISO();
+  const rows = qsa('#invoiceItemsBody tr');
+  if (!customerName || !rows.length) { toast('أدخل اسم العميل وصنفاً واحداً على الأقل', 'error'); return; }
+
+  const items = [];
+  for (const tr of rows) {
+    const prodId = tr.querySelector('.inv-item-product').value;
+    const prod = STATE.products.find(p => p.id === prodId);
+    const qty = Number(tr.querySelector('.inv-item-qty').value) || 0;
+    const price = Number(tr.querySelector('.inv-item-price').value) || 0;
+    const category = tr.querySelector('.inv-item-category').value || 'عادي';
+    if (!prod || qty <= 0) continue;
+    items.push({
+      product_id: prod.id, product_name: prod.name, category,
+      quantity: qty, price, cost_price: productUnitCost(prod),
+    });
+  }
+  if (!items.length) { toast('اختر منتجات صحيحة للفاتورة', 'error'); return; }
+
+  const newLeaves = leavesOfItems(items);
+  const oldItems = editingInvoiceId ? STATE.invoiceItems.filter(it => it.invoice_id === editingInvoiceId) : [];
+  const oldLeaves = leavesOfItems(oldItems);
+  const shortage = findShortage(newLeaves, oldLeaves);
+  if (shortage) { toast(`الكمية غير كافية في المخزون للصنف: ${shortage}`, 'error'); return; }
+
+  try {
+    let customer = STATE.customers.find(c => c.name === customerName);
+    if (!customer) {
+      customer = await Api.insert('customers', { name: customerName }, customerName);
+      STATE.customers.push(customer);
+    }
+    const total = items.reduce((s, it) => s + it.quantity * it.price, 0);
+
+    if (editingInvoiceId) {
+      await applyStockChange(oldLeaves, 'in', 'تعديل فاتورة #' + qs('#invNumber').value);
+      await Api.removeWhere('invoice_items', 'invoice_id', editingInvoiceId);
+      const updated = await Api.update('invoices', editingInvoiceId, {
+        customer_id: customer.id, customer_name: customer.name, invoice_date: invDate, total,
+      }, qs('#invNumber').value);
+      const insertedItems = await Api.insertMany('invoice_items', items.map(it => ({ ...it, invoice_id: editingInvoiceId })));
+      await applyStockChange(newLeaves, 'out', 'فاتورة #' + updated.invoice_number);
+      STATE.invoices = STATE.invoices.map(i => i.id === editingInvoiceId ? updated : i);
+      STATE.invoiceItems = [...STATE.invoiceItems.filter(it => it.invoice_id !== editingInvoiceId), ...insertedItems];
+    } else {
+      const inv = await Api.insert('invoices', {
+        invoice_number: qs('#invNumber').value, customer_id: customer.id,
+        customer_name: customer.name, invoice_date: invDate, total,
+      }, qs('#invNumber').value);
+      const insertedItems = await Api.insertMany('invoice_items', items.map(it => ({ ...it, invoice_id: inv.id })));
+      await applyStockChange(newLeaves, 'out', 'فاتورة #' + inv.invoice_number);
+      STATE.invoices.unshift(inv);
+      STATE.invoiceItems.push(...insertedItems);
+
+      const paidNow = Number(qs('#invPaidNow').value) || 0;
+      if (paidNow > 0) {
+        const pay = await Api.insert('customer_payments', {
+          customer_id: customer.id, invoice_id: inv.id, amount: paidNow, payment_date: invDate, note: 'دفعة عند إصدار الفاتورة',
+        });
+        STATE.customerPayments.unshift(pay);
+      }
+    }
+    closeModal('modalInvoice');
+    await loadAll();
+    toast('تم حفظ الفاتورة بنجاح', 'success');
+  } catch (err) { toast('خطأ أثناء حفظ الفاتورة: ' + err.message, 'error'); }
+});
+
+window.printInvoice = function (id) {
+  const inv = STATE.invoices.find(i => i.id === id);
+  if (!inv) return;
+  const items = STATE.invoiceItems.filter(it => it.invoice_id === id);
+  const paid = invoicePaid(id);
+  const co = STATE.settings || {};
+  qs('#printArea').innerHTML = `
+    <div style="padding:24px;direction:rtl;font-family:'Cairo',sans-serif;">
+      <div style="display:flex;justify-content:space-between;border-bottom:2px solid #0f172a;padding-bottom:12px;margin-bottom:16px;">
+        <div>
+          <h2 style="margin:0;">${co.company_name || 'مؤسسة زروق للخدمات المطبعية'}</h2>
+          <p style="margin:4px 0 0;font-size:13px;">${co.phone || ''} ${co.address ? '· ' + co.address : ''}</p>
+        </div>
+        <div style="text-align:left;">
+          <strong>فاتورة #${inv.invoice_number}</strong><br>
+          <span>التاريخ: ${fmtDateAr(inv.invoice_date)}</span><br>
+          <span>العميل: ${inv.customer_name || '—'}</span>
+        </div>
+      </div>
+      <table style="width:100%;border-collapse:collapse;margin-bottom:16px;">
+        <thead><tr style="background:#f1f5f9;"><th style="border:1px solid #cbd5e1;padding:8px;text-align:right;">الصنف</th><th style="border:1px solid #cbd5e1;padding:8px;">الكمية</th><th style="border:1px solid #cbd5e1;padding:8px;">السعر</th><th style="border:1px solid #cbd5e1;padding:8px;">الإجمالي</th></tr></thead>
+        <tbody>${items.map(it => `<tr><td style="border:1px solid #cbd5e1;padding:8px;">${it.product_name}</td><td style="border:1px solid #cbd5e1;padding:8px;text-align:center;">${it.quantity}</td><td style="border:1px solid #cbd5e1;padding:8px;text-align:center;">${money(it.price)}</td><td style="border:1px solid #cbd5e1;padding:8px;text-align:center;">${money(it.quantity * it.price)}</td></tr>`).join('')}</tbody>
+      </table>
+      <div style="text-align:left;font-size:15px;">
+        <div><strong>الإجمالي:</strong> ${money(inv.total)} أوقية</div>
+        <div><strong>المدفوع:</strong> ${money(paid)} أوقية</div>
+        <div><strong>المتبقي:</strong> ${money(Number(inv.total || 0) - paid)} أوقية</div>
+      </div>
+    </div>`;
+  window.print();
+};
+
+/* ================= دوال عرض الأقسام والجداول ================= */
+function renderManufactured() {
+  const rows = STATE.products.filter(p => p.type === 'manufactured');
+  qs('#manufacturedEmptyHint').style.display = rows.length ? 'none' : 'block';
+  qs('#manufacturedTableBody').innerHTML = rows.map(p => {
+    const cost = manufacturedUnitCost(p.id);
+    const profit = Number(p.sell_price || 0) - cost;
+    const bom = STATE.productMaterials.filter(pm => pm.product_id === p.id).map(pm => {
+      const m = STATE.materials.find(x => x.id === pm.material_id);
+      return m ? `${m.name} (${pm.qty_per_unit} ${m.unit || ''})` : '';
+    }).filter(Boolean).join('، ');
+    return `<tr>
+      <td class="cell-strong">${p.name}</td>
+      <td>${categoryBadge(p.category || 'عادي')}</td>
+      <td>${money(p.sell_price)} أ.م</td>
+      <td class="cost-only">${money(cost)} أ.م</td>
+      <td class="cost-only ${profit >= 0 ? 'text-success' : 'text-danger'}">${money(profit)} أ.م</td>
+      <td class="cell-sub">${bom || '—'}</td>
+      <td class="row-actions"><button class="btn-text danger" onclick="deleteProduct('${p.id}')">حذف</button></td>
+    </tr>`;
+  }).join('');
+}
+
+function renderSimple() {
+  const rows = STATE.products.filter(p => p.type === 'simple' || p.type === 'service');
+  qs('#simpleEmptyHint').style.display = rows.length ? 'none' : 'block';
+  qs('#simpleTableBody').innerHTML = rows.map(p => {
+    const cost = productUnitCost(p);
+    const profit = Number(p.sell_price || 0) - cost;
+    return `<tr>
+      <td class="cell-strong">${p.name}</td>
+      <td><span class="badge ${p.type === 'service' ? 'badge-service' : 'badge-cat'}">${p.type === 'service' ? 'خدمة' : 'منتج جاهز'}</span></td>
+      <td>${categoryBadge(p.category || 'عادي')}</td>
+      <td class="cost-only">${money(cost)} أ.م</td>
+      <td>${money(p.sell_price)} أ.م</td>
+      <td class="cost-only ${profit >= 0 ? 'text-success' : 'text-danger'}">${money(profit)} أ.م</td>
+      <td>${p.type === 'service' ? '—' : `<span class="${Number(p.quantity) <= 3 ? 'qty-low' : ''}">${p.quantity || 0}</span>`}</td>
+      <td class="row-actions"><button class="btn-text danger" onclick="deleteProduct('${p.id}')">حذف</button></td>
+    </tr>`;
+  }).join('');
+}
+
+function renderComposite() {
+  const rows = STATE.products.filter(p => p.type === 'composite');
+  qs('#compositeEmptyHint').style.display = rows.length ? 'none' : 'block';
+  qs('#compositeTableBody').innerHTML = rows.map(p => {
+    const cost = compositeUnitCost(p.id);
+    const profit = Number(p.sell_price || 0) - cost;
+    const comps = STATE.productComponents.filter(c => c.parent_product_id === p.id).map(c => {
+      const ch = STATE.products.find(x => x.id === c.component_product_id);
+      return ch ? `${ch.name} (×${c.quantity})` : '';
+    }).filter(Boolean).join(' + ');
+    return `<tr>
+      <td class="cell-strong">${p.name}</td>
+      <td>${categoryBadge(p.category || 'عادي')}</td>
+      <td>${money(p.sell_price)} أ.م</td>
+      <td class="cost-only">${money(cost)} أ.م</td>
+      <td class="cost-only ${profit >= 0 ? 'text-success' : 'text-danger'}">${money(profit)} أ.م</td>
+      <td class="cell-sub">${comps || '—'}</td>
+      <td class="row-actions"><button class="btn-text danger" onclick="deleteProduct('${p.id}')">حذف</button></td>
+    </tr>`;
+  }).join('');
+}
+
+window.deleteProduct = async function (id) {
+  if (!requireManager('حذف المنتجات')) return;
+  if (!confirm('هل تريد حذف هذا المنتج؟')) return;
+  try {
+    await Api.remove('products', id);
+    await loadAll();
+    toast('تم حذف المنتج', 'success');
+  } catch (err) { toast('تعذر الحذف: ' + err.message, 'error'); }
+};
+
+function renderMaterials() {
+  const term = (qs('#materialSearch')?.value || '').trim().toLowerCase();
+  const rows = STATE.materials.filter(m => !term || m.name?.toLowerCase().includes(term));
+  qs('#materialsEmptyHint').style.display = rows.length ? 'none' : 'block';
+  qs('#materialsTableBody').innerHTML = rows.map(m => `<tr>
+    <td class="cell-strong">${m.name}</td>
+    <td>${m.unit || 'قطعة'}</td>
+    <td><span class="${Number(m.quantity) <= 5 ? 'qty-low' : ''}">${Number(m.quantity || 0)}</span></td>
+    <td class="cost-only">${money(m.avg_cost)} أ.م</td>
+    <td class="cost-only">${money(Number(m.quantity || 0) * Number(m.avg_cost || 0))} أ.م</td>
+    <td class="row-actions"><button class="btn-text danger" onclick="deleteMaterial('${m.id}')">حذف</button></td>
+  </tr>`).join('');
+}
+qs('#materialSearch')?.addEventListener('input', renderMaterials);
+
+window.deleteMaterial = async function (id) {
+  if (!requireManager('حذف المواد')) return;
+  if (!confirm('هل تريد حذف هذه المادة؟')) return;
+  try { await Api.remove('materials', id); await loadAll(); toast('تم الحذف', 'success'); }
+  catch (err) { toast('تعذر الحذف: ' + err.message, 'error'); }
+};
+
+function renderMovements() {
+  const from = qs('#movementFilterFrom')?.value;
+  const to = qs('#movementFilterTo')?.value;
+  const dir = qs('#movementFilterDirection')?.value;
+  const rows = STATE.movements.filter(m =>
+    (!from || m.movement_date >= from) && (!to || m.movement_date <= to) && (!dir || m.direction === dir)
+  );
+  qs('#movementsEmptyHint').style.display = rows.length ? 'none' : 'block';
+  qs('#movementsTableBody').innerHTML = rows.map(m => `<tr>
+    <td class="cell-strong">${m.item_name || '—'}</td>
+    <td><span class="badge ${m.direction === 'in' ? 'badge-status-paid' : 'badge-status-unpaid'}">${m.direction === 'in' ? 'دخول' : 'خروج'}</span></td>
+    <td>${m.quantity}</td>
+    <td>${m.reason || '—'}</td>
+    <td>${fmtDateAr(m.movement_date)}</td>
+  </tr>`).join('');
+}
+['movementFilterFrom', 'movementFilterTo', 'movementFilterDirection'].forEach(id => qs('#' + id)?.addEventListener('input', renderMovements));
+
+function renderLosses() {
+  const from = qs('#lossFilterFrom')?.value;
+  const to = qs('#lossFilterTo')?.value;
+  const rows = STATE.losses.filter(l => (!from || l.loss_date >= from) && (!to || l.loss_date <= to));
+  qs('#lossesEmptyHint').style.display = rows.length ? 'none' : 'block';
+  qs('#lossesTableBody').innerHTML = rows.map(l => `<tr>
+    <td class="cell-strong">${l.item_name || '—'}</td>
+    <td>${l.quantity}</td>
+    <td class="cost-only">${money(l.unit_cost)} أ.م</td>
+    <td class="cost-only text-danger">${money(l.total_cost)} أ.م</td>
+    <td>${l.reason || '—'}</td>
+    <td>${fmtDateAr(l.loss_date)}</td>
+    <td></td>
+  </tr>`).join('');
+}
+['lossFilterFrom', 'lossFilterTo'].forEach(id => qs('#' + id)?.addEventListener('input', renderLosses));
+
+function renderAdjustments() {
+  const rows = STATE.movements.filter(m => m.quantity_before !== null && m.quantity_after !== null);
+  qs('#adjustmentsEmptyHint').style.display = rows.length ? 'none' : 'block';
+  qs('#adjustmentsTableBody').innerHTML = rows.map(m => {
+    const diff = Number(m.quantity_after) - Number(m.quantity_before);
+    return `<tr>
+      <td class="cell-strong">${m.item_name}</td>
+      <td>${m.quantity_before}</td>
+      <td>${m.quantity_after}</td>
+      <td class="${diff >= 0 ? 'text-success' : 'text-danger'}">${diff > 0 ? '+' + diff : diff}</td>
+      <td>${m.reason || '—'}</td>
+      <td>${fmtDateAr(m.movement_date)}</td>
+    </tr>`;
+  }).join('');
+}
+
+function renderPurchases() {
+  const from = qs('#purchaseFilterFrom')?.value;
+  const to = qs('#purchaseFilterTo')?.value;
+  const rows = STATE.purchases.filter(p => (!from || p.purchase_date >= from) && (!to || p.purchase_date <= to));
+  qs('#purchasesEmptyHint').style.display = rows.length ? 'none' : 'block';
+  qs('#purchasesTableBody').innerHTML = rows.map(p => {
+    const paid = purchasePaid(p.id);
+    const rem = Number(p.total || 0) - paid;
+    const count = STATE.purchaseItems.filter(it => it.purchase_id === p.id).length;
+    return `<tr class="${p.is_cancelled ? 'row-cancelled' : ''}">
+      <td class="cell-strong">${p.supplier_name || '—'}</td>
+      <td>${count}</td>
+      <td>${fmtDateAr(p.purchase_date)}</td>
+      <td>${money(p.total)} أ.م</td>
+      <td class="text-success">${money(paid)}</td>
+      <td class="${rem > 0 ? 'text-danger' : ''}">${money(rem)}</td>
+      <td><span class="badge ${rem <= 0.009 ? 'badge-status-paid' : paid > 0 ? 'badge-status-partial' : 'badge-status-unpaid'}">${rem <= 0.009 ? 'مدفوعة' : paid > 0 ? 'جزئي' : 'آجل'}</span></td>
+      <td class="row-actions">
+        <button class="btn-text" onclick="openPaymentModal('purchase','${p.id}','دفعة للمورّد')">دفعة</button>
+      </td>
+    </tr>`;
+  }).join('');
+}
+['purchaseFilterFrom', 'purchaseFilterTo'].forEach(id => qs('#' + id)?.addEventListener('input', renderPurchases));
+
+function renderExpenses() {
+  const from = qs('#expenseFilterFrom')?.value;
+  const to = qs('#expenseFilterTo')?.value;
+  const rows = STATE.expenses.filter(e => (!from || e.expense_date >= from) && (!to || e.expense_date <= to));
+  qs('#expensesEmptyHint').style.display = rows.length ? 'none' : 'block';
+  qs('#expensesTableBody').innerHTML = rows.map(e => `<tr class="${e.is_cancelled ? 'row-cancelled' : ''}">
+    <td class="cell-strong">${e.description || '—'}</td>
+    <td><span class="badge badge-cat">${e.category || 'عام'}</span></td>
+    <td class="text-danger">${money(e.amount)} أ.م</td>
+    <td>${fmtDateAr(e.expense_date)}</td>
+    <td><span class="badge ${e.is_cancelled ? 'badge-status-unpaid' : 'badge-status-paid'}">${e.is_cancelled ? 'ملغى' : 'مؤكد'}</span></td>
+    <td></td>
+  </tr>`).join('');
+}
+['expenseFilterFrom', 'expenseFilterTo'].forEach(id => qs('#' + id)?.addEventListener('input', renderExpenses));
+
+function renderEmployees() {
+  qs('#employeesEmptyHint').style.display = STATE.employees.length ? 'none' : 'block';
+  qs('#employeesTableBody').innerHTML = STATE.employees.map(emp => {
+    const pays = activeExpenses().filter(e => e.employee_id === emp.id);
+    const total = pays.reduce((s, e) => s + Number(e.amount || 0), 0);
+    return `<tr>
+      <td class="cell-strong">${emp.name}</td>
+      <td>${money(total)} أ.م</td>
+      <td>${pays[0] ? fmtDateAr(pays[0].expense_date) : '—'}</td>
+      <td></td>
+    </tr>`;
+  }).join('');
+}
+
+function renderCustomers() {
+  const term = (qs('#customerSearch')?.value || '').trim().toLowerCase();
+  const rows = STATE.customers.filter(c => !term || c.name?.toLowerCase().includes(term) || c.phone?.includes(term));
+  qs('#customersEmptyHint').style.display = rows.length ? 'none' : 'block';
+  qs('#customersTableBody').innerHTML = rows.map(c => {
+    const b = customerBalance(c.id);
+    return `<tr>
+      <td class="cell-strong">${c.name}</td>
+      <td>${c.phone || '—'}</td>
+      <td>${money(b.invoiced)} أ.م</td>
+      <td class="text-success">${money(b.paid)} أ.م</td>
+      <td class="${b.remaining > 0 ? 'text-danger' : ''}">${money(b.remaining)} أ.م</td>
+      <td class="row-actions">
+        <button class="btn-text" onclick="openPaymentModal('customer','${c.id}','دفعة من العميل: ${c.name}')">تسجيل دفعة</button>
+      </td>
+    </tr>`;
+  }).join('');
+}
+qs('#customerSearch')?.addEventListener('input', renderCustomers);
+
+function renderSuppliers() {
+  const term = (qs('#supplierSearch')?.value || '').trim().toLowerCase();
+  const rows = STATE.suppliers.filter(s => !term || s.name?.toLowerCase().includes(term) || s.phone?.includes(term));
+  qs('#suppliersEmptyHint').style.display = rows.length ? 'none' : 'block';
+  qs('#suppliersTableBody').innerHTML = rows.map(s => {
+    const b = supplierBalance(s.id);
+    return `<tr>
+      <td class="cell-strong">${s.name}</td>
+      <td>${s.phone || '—'}</td>
+      <td>${money(b.purchased)} أ.م</td>
+      <td class="text-success">${money(b.paid)} أ.م</td>
+      <td class="${b.remaining > 0 ? 'text-danger' : ''}">${money(b.remaining)} أ.م</td>
+      <td class="row-actions">
+        <button class="btn-text" onclick="openPaymentModal('supplier','${s.id}','دفعة للمورّد: ${s.name}')">تسجيل دفعة</button>
+      </td>
+    </tr>`;
+  }).join('');
+}
+qs('#supplierSearch')?.addEventListener('input', renderSuppliers);
+
+function renderSettings() {
+  const s = STATE.settings || {};
+  if (qs('#setCompanyName')) qs('#setCompanyName').value = s.company_name || '';
+  if (qs('#setPhone')) qs('#setPhone').value = s.phone || '';
+  if (qs('#setAddress')) qs('#setAddress').value = s.address || '';
+  if (qs('#setLogoUrl')) qs('#setLogoUrl').value = s.logo_url || '';
+  if (qs('#logoPreview')) qs('#logoPreview').src = s.logo_url || '';
+}
+
+function renderAuditLog() {
+  const el = qs('#auditLogList');
+  if (!el) return;
+  el.innerHTML = STATE.auditLog.length ? STATE.auditLog.map(a => `
+    <div class="mini-row">
+      <div><div class="mini-row-title">${a.action} — ${a.entity}</div><div class="mini-row-sub">${a.entity_label || ''} · ${a.user_email || a.role || ''}</div></div>
+      <div class="cell-sub">${fmtDateAr(a.created_at)}</div>
+    </div>`).join('') : `<p class="mini-empty">لا توجد عمليات مسجلة</p>`;
+}
+
+function fillDatalists() {
+  if (qs('#customerNamesList')) qs('#customerNamesList').innerHTML = STATE.customers.map(c => `<option value="${c.name}">`).join('');
+  if (qs('#supplierNamesList')) qs('#supplierNamesList').innerHTML = STATE.suppliers.map(s => `<option value="${s.name}">`).join('');
+}
+
+/* ===
    
